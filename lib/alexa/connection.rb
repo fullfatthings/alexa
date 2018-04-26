@@ -11,6 +11,7 @@ module Alexa
     attr_writer :params
 
     RFC_3986_UNRESERVED_CHARS = "-_.~a-zA-Z\\d"
+    SIGNATURE_ALGORITHM = 'AWS4-HMAC-SHA256'
 
     def initialize(credentials = {})
       self.secret_access_key = credentials.fetch(:secret_access_key)
@@ -26,57 +27,90 @@ module Alexa
       handle_response(request).body.force_encoding(Encoding::UTF_8)
     end
 
+    private
+
     def handle_response(response)
       case response.status.to_i
       when 200...300
         response
       when 300...600
-        if response.body.nil?
-          raise ResponseError.new(nil, response)
-        else
-          xml = MultiXml.parse(response.body)
-          message = xml["Response"]["Errors"]["Error"]["Message"]
-          raise ResponseError.new(message, response)
-        end
+        raise ResponseError.new('Alexa API Error', response)
       else
         raise ResponseError.new("Unknown code: #{response.code}", response)
       end
     end
 
     def request
-      Faraday.get(uri)
+      Faraday.get(uri) do |req|
+        req.headers = headers
+      end
     end
 
     def timestamp
-      @timestamp ||= Time::now.utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+      @timestamp ||= Time::now.utc.strftime("%Y%m%dT%H%M%SZ")
     end
 
-    def signature
-      Base64.encode64(OpenSSL::HMAC.digest(OpenSSL::Digest.new("sha256"), secret_access_key, sign)).strip
+    def datestamp
+      @datestamp ||= Time::now.utc.strftime("%Y%m%d")
     end
 
     def uri
-      URI.parse("http://#{Alexa::API_HOST}/?" + query + "&Signature=" + CGI::escape(signature))
-    end
-
-    def default_params
-      {
-        "AWSAccessKeyId"   => access_key_id,
-        "SignatureMethod"  => "HmacSHA256",
-        "SignatureVersion" => "2",
-        "Timestamp"        => timestamp,
-        "Version"          => Alexa::API_VERSION
-      }
-    end
-
-    def sign
-      "GET\n" + Alexa::API_HOST + "\n/\n" + query
+      URI.parse("https://#{Alexa::API_HOST}#{Alexa::API_URI}?" + query)
     end
 
     def query
-      default_params.merge(params).map do |key, value|
-        "#{key}=#{URI.escape(value.to_s, Regexp.new("[^#{RFC_3986_UNRESERVED_CHARS}]"))}"
-      end.sort.join("&")
+      params.map do |key, value|
+        "#{key}=#{rfc3986_escape(value.to_s)}"
+      end.sort.join('&')
+    end
+
+    def canonical_request
+      headers_str = signed_headers.map { |k,v| k + ':' + v }.join("\n") + "\n"
+      headers_lst = signed_headers.keys.join(';')
+      'GET' + "\n" + Alexa::API_URI + "\n" + query + "\n" + headers_str + "\n" + headers_lst + "\n" + Digest::SHA256.hexdigest('')
+    end
+
+    def signed_headers
+      {
+        "host"       => Alexa::API_ENDPOINT,
+        "x-amz-date" => timestamp
+      }
+    end
+
+    def headers
+      {
+        "accept"        => "application/xml",
+        "authorization" => authorization_header,
+        "x-amz-date"    => timestamp
+      }
+    end
+
+    def credentials_scope
+      datestamp + "/" + Alexa::API_REGION + "/" + Alexa::API_NAME + "/" + "aws4_request"
+    end
+
+    def authorization_header
+      headers_lst = signed_headers.keys.join(';')
+      SIGNATURE_ALGORITHM + " " + "Credential=" + access_key_id + "/" + credentials_scope + ", " +  "SignedHeaders=" + headers_lst + ", " + "Signature=" + signature
+    end
+
+    def string_to_sign
+      SIGNATURE_ALGORITHM + "\n" +  timestamp + "\n" +  credentials_scope + "\n" + (Digest::SHA256.hexdigest canonical_request)
+    end
+
+    def signature
+      OpenSSL::HMAC.hexdigest('sha256', signature_key, string_to_sign)
+    end
+
+    def signature_key
+      sig_date    = OpenSSL::HMAC.digest('sha256', 'AWS4' + secret_access_key, datestamp)
+      sig_region  = OpenSSL::HMAC.digest('sha256', sig_date, Alexa::API_REGION)
+      sig_service = OpenSSL::HMAC.digest('sha256', sig_region, Alexa::API_NAME)
+      OpenSSL::HMAC.digest('sha256', sig_service, 'aws4_request')
+    end
+
+    def rfc3986_escape(str)
+      URI.escape(str, Regexp.new("[^#{RFC_3986_UNRESERVED_CHARS}]"))
     end
   end
 end
